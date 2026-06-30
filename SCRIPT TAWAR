@@ -1,0 +1,528 @@
+// ==UserScript==
+// @name         Otomasi Form Input Cabang-MARS SPS (Otomatis Skip Error - ASP.NET Fix)
+// @namespace    http://tampermonkey.net/
+// @version      2.1
+// @description  Mengisi Kode -> Enter -> Qty -> Enter -> H.Akhir -> Enter dengan pendeteksi error, Auto-Wait Postback ASP.NET, dan Ekspor Log .txt
+// @author       Gemini
+// @match        http://192.168.0.101/wars_websbp/frmBargain.aspx*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // State penyimpan elemen target (bisa otomatis atau manual via bidik)
+    let targets = {
+        inputKode: null,
+        inputQty: null,
+        inputHakhir: null
+    };
+
+    let queueData = [];
+    let currentIndex = 0;
+    let isRunning = false;
+    let timerId = null;
+    let targetSelectionMode = null; // 'kode', 'qty', 'hakhir'
+    let riwayatProses = []; // Menyimpan log terstruktur untuk diunduh nanti
+
+    // Helper Jeda Waktu
+    function sleep(ms) {
+        return new Promise(resolve => timerId = setTimeout(resolve, ms));
+    }
+
+    // Mencari elemen input secara dinamis (mencegah detached DOM akibat UpdatePanel ASP.NET)
+    function dapatkanElemenAktual(tipe) {
+        // Jika user pernah membidik secara manual, cari berdasarkan selector unik yang direkam
+        if (targets[tipe] && document.body.contains(targets[tipe])) {
+            return targets[tipe];
+        }
+
+        // Jalur deteksi otomatis berdasarkan pola nama/id ASP.NET
+        let el = null;
+        if (tipe === 'inputKode') {
+            el = document.querySelector("input[id*='txtKode'], input[name*='Kode'], input[id*='KodeBarang']");
+        } else if (tipe === 'inputQty') {
+            el = document.querySelector("input[id*='txtQty'], input[name*='Qty'], input[id*='txtJumlah']");
+        } else if (tipe === 'inputHakhir') {
+            el = document.querySelector("input[id*='txtHAkhir'], input[id*='txtHakhir'], input[name*='HAkhir'], input[name*='H_Akhir']");
+        }
+
+        // Jika otomatis masih gagal, cari berdasarkan urutan input text yang aktif di bagian bawah form
+        if (!el) {
+            const semuaInputText = Array.from(document.querySelectorAll("input[type='text']:not([readonly]):not([disabled])"));
+            // Biasanya 3 input terbawah yang aktif berdampingan adalah Kode, Qty, H.Akhir
+            if (semuaInputText.length >= 3) {
+                if (tipe === 'inputKode') el = semuaInputText[semuaInputText.length - 3];
+                if (tipe === 'inputQty') el = semuaInputText[semuaInputText.length - 2];
+                if (tipe === 'inputHakhir') el = semuaInputText[semuaInputText.length - 1];
+            }
+        }
+
+        return el;
+    }
+
+    // Fungsi trigger event yang mensimulasikan pengetikan nyata & trigger postback ASP.NET secara sempurna
+    function pemicuPostback(element, value) {
+        if (!element) return;
+
+        element.focus();
+        element.value = value;
+
+        // Kirim event input & change agar model data di web terupdate
+        element.dispatchEvent(new Event('input', { bubbles: true }));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+
+        // Kirim KeyboardEvent ENTER
+        const events = ['keydown', 'keypress', 'keyup'];
+        events.forEach(eventName => {
+            const ev = new KeyboardEvent(eventName, {
+                bubbles: true,
+                cancelable: true,
+                key: 'Enter',
+                code: 'Enter',
+                keyCode: 13,
+                which: 13
+            });
+            element.dispatchEvent(ev);
+        });
+
+        // Trigger BLUR (Sangat krusial untuk memicu atribut AutoPostBack="True" di ASP.NET)
+        element.dispatchEvent(new Event('blur', { bubbles: true }));
+
+        // Jika elemen memiliki fungsi onchange bawaan inline html, jalankan langsung
+        if (typeof element.onchange === 'function') {
+            try { element.onchange(); } catch(e) {}
+        }
+    }
+
+    // Fungsi mengecek apakah halaman ASP.NET sedang sibuk melakukan Ajax Postback (Loading)
+    function isPageLoading() {
+        try {
+            if (window.Sys && window.Sys.WebForms && window.Sys.WebForms.PageRequestManager) {
+                return window.Sys.WebForms.PageRequestManager.getInstance().get_isInAsyncPostBack();
+            }
+        } catch(e) {}
+        return false;
+    }
+
+    // Menunggu hingga loading Ajax ASP.NET selesai
+    async function tungguLoadingSelesai(maxWaitMs = 5000) {
+        const start = Date.now();
+        await sleep(200); // Tunggu sebentar agar status loading sempat aktif
+        while (isPageLoading() && (Date.now() - start < maxWaitMs)) {
+            await sleep(100);
+        }
+        await sleep(300); // Jeda aman pasca-loading
+    }
+
+    // Fungsi utama eksekusi otomasi
+    async function jalankanProses() {
+        if (!isRunning) return;
+
+        if (currentIndex >= queueData.length) {
+            updateStatusText("Selesai!", "color: #10B981; font-weight: bold;");
+            alert("Otomasi Selesai! Semua data telah berhasil diproses.");
+            berhentiOtomasi();
+            return;
+        }
+
+        const item = queueData[currentIndex];
+        updateStatusText(`Memproses [${currentIndex + 1}/${queueData.length}]: ${item.kode}`, "color: #3B82F6; font-weight: bold;");
+
+        // Dapatkan element input terbaru (mencegah error detached element akibat refresh ASP UpdatePanel)
+        const elKode = dapatkanElemenAktual('inputKode');
+        const elQty = dapatkanElemenAktual('inputQty');
+        const elHakhir = dapatkanElemenAktual('inputHakhir');
+
+        const userDelay = parseInt(document.getElementById('otm-delay-input').value) || 1000;
+
+        if (!elKode) {
+            alert(`Gagal mendeteksi kolom INPUT KODE!\n\nSilakan gunakan tombol "🎯 Bidik Kolom Manual" di panel terlebih dahulu.`);
+            berhentiOtomasi();
+            return;
+        }
+
+        try {
+            // --- LANGKAH 1: ISI KODE & TEKAN ENTER ---
+            tambahMiniLog(`Mengisi Kode: ${item.kode}`);
+            pemicuPostback(elKode, item.kode);
+
+            // Tunggu postback server merespons pencarian kode barang
+            await tungguLoadingSelesai(5000);
+            await sleep(userDelay);
+
+            // --- LANGKAH 2: ISI QTY & TEKAN ENTER ---
+            const elQtyTerbaru = dapatkanElemenAktual('inputQty');
+            if (elQtyTerbaru) {
+                tambahMiniLog(`Mengisi Qty: ${item.qty}`);
+                pemicuPostback(elQtyTerbaru, item.qty);
+
+                await tungguLoadingSelesai(4000);
+                await sleep(userDelay);
+            } else {
+                tambahMiniLog(`[Warning] Kolom Qty tidak ditemukan/disabled. Skip langkah Qty.`, "#F59E0B");
+            }
+
+            // --- LANGKAH 3: ISI H.AKHIR & TEKAN ENTER ---
+            const elHakhirTerbaru = dapatkanElemenAktual('inputHakhir');
+            if (elHakhirTerbaru) {
+                // Pastikan hanya angka dan titik desimal saja yang diinput (bersihkan tanda seru, koma ribuan, dsb)
+                const cleanPrice = item.hAkhir.toString().replace(/[^0-9.]/g, '');
+                tambahMiniLog(`Mengisi Harga Akhir: ${cleanPrice}`);
+                pemicuPostback(elHakhirTerbaru, cleanPrice);
+
+                // Tunggu kalkulasi akhir dari server
+                await tungguLoadingSelesai(4000);
+                await sleep(userDelay + 200);
+            } else {
+                tambahMiniLog(`[Warning] Kolom Harga Akhir tidak ditemukan/disabled. Skip langkah Harga Akhir.`, "#F59E0B");
+            }
+
+            // --- LANGKAH 4: CEK ERROR "Tidak bisa melebihi harga awal" ---
+            const teksHalaman = document.body.innerText;
+            const deteksiErrorHarga = teksHalaman.includes("Tidak bisa melebihi harga awal") || teksHalaman.includes("Input string was not in a correct format");
+
+            if (deteksiErrorHarga) {
+                tambahMiniLog(`⚠️ [LIMIT/FORMAT ERROR] Kode ${item.kode} ditolak karena batas harga atau salah format!`, "#EF4444");
+                tambahLogStatus(item.kode, "SKIPPED", "Melebihi harga awal / salah format");
+
+                // Bersihkan kembali input Kode agar siap menerima kode berikutnya tanpa tumpang tindih
+                const elKodeReset = dapatkanElemenAktual('inputKode');
+                if (elKodeReset) {
+                    elKodeReset.value = "";
+                    elKodeReset.focus();
+                }
+
+                currentIndex++;
+                setTimeout(jalankanProses, 500);
+            } else {
+                tambahMiniLog(`✅ Berhasil memproses Kode: ${item.kode}`, "#10B981");
+                tambahLogStatus(item.kode, "SUKSES", "Tersimpan");
+
+                currentIndex++;
+                setTimeout(jalankanProses, 500);
+            }
+
+        } catch (err) {
+            tambahMiniLog(`❌ Error Eksekusi: ${err.message}`, "#EF4444");
+            console.error("[OTOMASI] Error detail:", err);
+            berhentiOtomasi();
+        }
+    }
+
+    // Parser data dari Excel
+    // Mendukung pemisahan tabulasi standar salinan Excel
+    function parseExcelInput(rawText) {
+        if (!rawText.trim()) return [];
+        const lines = rawText.split('\n');
+        const results = [];
+
+        let startIndex = 0;
+        if (lines[0].toUpperCase().includes("KODE") || lines[0].toUpperCase().includes("PRODUK")) {
+            startIndex = 1;
+        }
+
+        for (let i = startIndex; i < lines.length; i++) {
+            const columns = lines[i].split('\t');
+            if (columns.length >= 3) {
+                const kode = columns[0].trim();
+                const qty = columns[2].trim();
+                const hAkhir = columns[3] ? columns[3].trim().replace(/,/g, '') : "0";
+
+                if (kode) {
+                    results.push({ kode, qty, hAkhir });
+                }
+            }
+        }
+        return results;
+    }
+
+    function berhentiOtomasi() {
+        isRunning = false;
+        if (timerId) clearTimeout(timerId);
+
+        const btnMulai = document.getElementById('otm-btn-start');
+        const btnStop = document.getElementById('otm-btn-stop');
+
+        if (btnMulai) {
+            btnMulai.disabled = false;
+            btnMulai.innerText = "▶ Mulai";
+            btnMulai.style.backgroundColor = '#10B981';
+        }
+        if (btnStop) {
+            btnStop.disabled = true;
+            btnStop.style.backgroundColor = '#9CA3AF';
+        }
+        updateStatusText("Berhenti", "color: #EF4444; font-weight: bold;");
+    }
+
+    // === FITUR BIDIK KOLOM SECARA MANUAL ===
+    function aktifkanModeBidik(tipe) {
+        targetSelectionMode = tipe;
+        updateStatusText(`Klik kolom [${tipe.replace('input', '').toUpperCase()}] di halaman web Anda...`, "color: #F59E0B; font-weight: bold;");
+        document.body.style.cursor = "crosshair";
+    }
+
+    // Listener klik global saat mode bidik aktif
+    document.addEventListener('click', function(e) {
+        if (!targetSelectionMode) return;
+
+        // Cegah aksi klik default browser
+        e.preventDefault();
+        e.stopPropagation();
+
+        const targetEl = e.target;
+        if (targetEl.tagName === 'INPUT') {
+            targets[targetSelectionMode] = targetEl;
+            tambahMiniLog(`🎯 Terkunci [${targetSelectionMode.replace('input', '').toUpperCase()}]: ID="${targetEl.id}"`);
+
+            // Highlight element sejenak
+            const borderAwal = targetEl.style.border;
+            targetEl.style.border = "3px solid #F59E0B";
+            setTimeout(() => { targetEl.style.border = borderAwal; }, 1000);
+
+            // Alur bidik berurutan otomatis untuk kemudahan user
+            if (targetSelectionMode === 'inputKode') {
+                aktifkanModeBidik('inputQty');
+            } else if (targetSelectionMode === 'inputQty') {
+                aktifkanModeBidik('inputHakhir');
+            } else {
+                targetSelectionMode = null;
+                document.body.style.cursor = "default";
+                updateStatusText("Kolom siap digunakan!", "color: #10B981; font-weight: bold;");
+                tambahMiniLog("✅ Semua koordinat kolom sukses dikunci!");
+            }
+        } else {
+            alert("Harap klik tepat pada kotak kolom input (Textbox)!");
+        }
+    }, true);
+
+
+    // === FUNGSI EKSPOR LOG MENJADI BERKAS TEKS ===
+    function unduhLogFile() {
+        if (riwayatProses.length === 0) {
+            alert("Belum ada riwayat proses yang tercatat untuk diunduh!");
+            return;
+        }
+
+        let formatLog = "========================================================\n";
+        formatLog += "            RIWAYAT HASIL OTOMASI INPUT TAWAR       \n";
+        formatLog += ` Tanggal Ekspor : ${new Date().toLocaleDateString('id-ID')} - ${new Date().toLocaleTimeString('id-ID')}\n`;
+        formatLog += "========================================================\n\n";
+
+        riwayatProses.forEach((item, index) => {
+            formatLog += `[${item.waktu}] No. ${index + 1} | Kode: ${item.kode} | Status: ${item.status} | Keterangan: ${item.alasan || 'Sukses Tersimpan'}\n`;
+        });
+
+        formatLog += "\n========================================================\n";
+        formatLog += ` Total Item Sukses : ${riwayatProses.filter(x => x.status === "SUKSES").length} item\n`;
+        formatLog += ` Total Item Gagal  : ${riwayatProses.filter(x => x.status !== "SUKSES").length} item\n`;
+        formatLog += "========================================================\n";
+
+        // Membuat objek Blob untuk memicu pengunduhan browser asli
+        const blob = new Blob([formatLog], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+
+        // Atur nama berkas teks hasil unduhan
+        const tglSekarang = new Date().toISOString().slice(0, 10);
+        a.href = url;
+        a.download = `Log_Otomasi_MARS_${tglSekarang}.txt`;
+
+        document.body.appendChild(a);
+        a.click();
+
+        // Bersihkan objek memori browser
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        tambahMiniLog("💾 Berkas log berhasil diekspor & diunduh!");
+    }
+
+
+    // === ELEMEN ANTARMUKA USER (PANEL KONTROL LENGKAP) ===
+    function buatPanelKontrol() {
+        // Hapus panel lama jika ada
+        const panelLama = document.getElementById('otm-control-panel');
+        if (panelLama) panelLama.remove();
+
+        const panel = document.createElement('div');
+        panel.id = 'otm-control-panel';
+        panel.style.position = 'fixed';
+        panel.style.bottom = '20px';
+        panel.style.right = '20px';
+        panel.style.width = '360px';
+        panel.style.backgroundColor = '#ffffff';
+        panel.style.border = '3px solid #047857';
+        panel.style.borderRadius = '10px';
+        panel.style.boxShadow = '0 15px 25px -5px rgba(0, 0, 0, 0.4)';
+        panel.style.zIndex = '999999';
+        panel.style.fontFamily = 'Arial, sans-serif';
+        panel.style.display = 'none';
+        panel.style.overflow = 'hidden';
+
+        panel.innerHTML = `
+            <div style="background-color: #047857; color: white; padding: 12px; font-weight: bold; font-size: 13px; display: flex; justify-content: space-between; align-items: center;">
+                <span>🚀 OTOMASI INPUT TAWAR v2.1</span>
+                <span id="otm-btn-close" style="cursor: pointer; font-size: 20px; font-weight: bold;">&times;</span>
+            </div>
+
+            <div style="padding: 12px; font-size: 11px; color: #374151; box-sizing: border-box;">
+                <!-- Tombol Bidik Manual -->
+                <div style="margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; background-color: #FEF3C7; padding: 6px; border-radius: 6px; border: 1px solid #F59E0B;">
+                    <span style="font-weight: bold; color: #D97706;">Macet / Salah Kolom?</span>
+                    <button id="otm-btn-bidik" style="padding: 6px 10px; background-color: #D97706; color: white; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; font-size: 10px;">
+                        🎯 Bidik Kolom Manual
+                    </button>
+                </div>
+
+                <label style="display: block; font-weight: bold; margin-bottom: 4px;">Paste Data Tabel Excel (KODE s/d H.MANAGER):</label>
+                <textarea id="otm-textarea-data" placeholder="Contoh:&#10;1033057	NAMA BARANG	43	8778.00" style="width: 100%; height: 100px; font-family: monospace; font-size: 10px; border: 1px solid #D1D5DB; border-radius: 4px; padding: 6px; box-sizing: border-box; resize: none;"></textarea>
+
+                <div style="margin-top: 8px; display: flex; justify-content: space-between; align-items: center;">
+                    <label style="font-weight: bold;">Jeda Per Aksi (Milidetik):</label>
+                    <input type="number" id="otm-delay-input" value="1000" min="500" style="width: 70px; border: 1px solid #D1D5DB; border-radius: 4px; padding: 4px; text-align: center; font-weight: bold;">
+                </div>
+
+                <div style="margin-top: 8px; padding: 6px; background-color: #F3F4F6; border-radius: 4px; display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-weight: bold;">Status Operasi:</span>
+                    <span id="otm-status-val" style="font-weight: bold; color: #4B5563;">Menunggu Input</span>
+                </div>
+
+                <div style="margin-top: 10px; display: flex; gap: 6px;">
+                    <button id="otm-btn-start" style="flex: 1.2; padding: 10px 5px; background-color: #10B981; color: white; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; font-size: 11px; transition: 0.2s;">▶ Mulai</button>
+                    <button id="otm-btn-stop" disabled style="flex: 1.2; padding: 10px 5px; background-color: #9CA3AF; color: white; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; font-size: 11px; transition: 0.2s;">⏹ Berhenti</button>
+                    <button id="otm-btn-download" style="flex: 1.6; padding: 10px 5px; background-color: #3B82F6; color: white; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; font-size: 11px; transition: 0.2s;">💾 Unduh Log</button>
+                </div>
+
+                <!-- Logger Monitor -->
+                <div style="margin-top: 10px;">
+                    <span style="font-weight: bold; display: block; margin-bottom: 3px;">Aktivitas Bot:</span>
+                    <div id="otm-mini-log" style="height: 60px; overflow-y: auto; background-color: #111827; color: #34D399; font-family: monospace; font-size: 9px; padding: 6px; border-radius: 4px; border: 1px solid #374151;">
+                        [System] Siap berjalan.
+                    </div>
+                    <div id="otm-log-box" style="height: 60px; overflow-y: auto; background-color: #1F2937; color: #9CA3AF; font-family: monospace; font-size: 9px; padding: 6px; border-radius: 4px; border: 1px solid #374151; margin-top: 4px;">
+                        [Laporan] Belum ada data masuk.
+                    </div>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(panel);
+
+        // Cari tombol pemicu melayang di web asli
+        let mainTriggerBtn = document.getElementById('otm-main-trigger');
+        if (!mainTriggerBtn) {
+            mainTriggerBtn = document.createElement('button');
+            mainTriggerBtn.id = 'otm-main-trigger';
+            mainTriggerBtn.innerHTML = '🚀 Buka Panel Otomasi';
+            mainTriggerBtn.style.position = 'fixed';
+            mainTriggerBtn.style.top = '10px';
+            mainTriggerBtn.style.right = '10px';
+            mainTriggerBtn.style.zIndex = '999998';
+            mainTriggerBtn.style.padding = '10px 18px';
+            mainTriggerBtn.style.backgroundColor = '#047857';
+            mainTriggerBtn.style.color = 'white';
+            mainTriggerBtn.style.fontWeight = 'bold';
+            mainTriggerBtn.style.border = '2px solid #ffffff';
+            mainTriggerBtn.style.borderRadius = '8px';
+            mainTriggerBtn.style.cursor = 'pointer';
+            mainTriggerBtn.style.boxShadow = '0 6px 12px rgba(0,0,0,0.25)';
+            mainTriggerBtn.style.fontSize = '12px';
+            document.body.appendChild(mainTriggerBtn);
+        }
+
+        // --- BIND EVENT ---
+        mainTriggerBtn.addEventListener('click', () => {
+            const saatIni = panel.style.display;
+            panel.style.display = saatIni === 'none' ? 'block' : 'none';
+        });
+
+        document.getElementById('otm-btn-close').addEventListener('click', () => {
+            panel.style.display = 'none';
+        });
+
+        document.getElementById('otm-btn-bidik').addEventListener('click', () => {
+            aktifkanModeBidik('inputKode');
+        });
+
+        const btnMulai = document.getElementById('otm-btn-start');
+        const btnBerhenti = document.getElementById('otm-btn-stop');
+        const btnUnduhLog = document.getElementById('otm-btn-download');
+
+        btnMulai.addEventListener('click', () => {
+            const rawExcel = document.getElementById('otm-textarea-data').value;
+            queueData = parseExcelInput(rawExcel);
+
+            if (queueData.length === 0) {
+                alert("Silakan tempel (paste) baris data dari Excel Anda terlebih dahulu ke dalam kotak teks!");
+                return;
+            }
+
+            isRunning = true;
+            currentIndex = 0;
+            riwayatProses = []; // Reset riwayat proses saat memulai data baru
+
+            btnMulai.disabled = true;
+            btnMulai.innerText = "⏳ Memproses...";
+            btnMulai.style.backgroundColor = '#9CA3AF';
+
+            btnBerhenti.disabled = false;
+            btnBerhenti.style.backgroundColor = '#EF4444';
+
+            document.getElementById('otm-log-box').innerHTML = "";
+            document.getElementById('otm-mini-log').innerHTML = "";
+            jalankanProses();
+        });
+
+        btnBerhenti.addEventListener('click', berhentiOtomasi);
+        btnUnduhLog.addEventListener('click', unduhLogFile);
+    }
+
+    function updateStatusText(text, styleAttr = "") {
+        const el = document.getElementById('otm-status-val');
+        if (el) {
+            el.innerText = text;
+            if (styleAttr) el.style.cssText = styleAttr;
+        }
+    }
+
+    function tambahMiniLog(teks, warna = "#34D399") {
+        const logBox = document.getElementById('otm-mini-log');
+        if (logBox) {
+            const div = document.createElement('div');
+            div.style.color = warna;
+            div.innerText = `> ${teks}`;
+            logBox.appendChild(div);
+            logBox.scrollTop = logBox.scrollHeight;
+        }
+    }
+
+    function tambahLogStatus(kode, status, alasan = "") {
+        const logBox = document.getElementById('otm-log-box');
+        const waktu = new Date().toLocaleTimeString('id-ID');
+
+        // Simpan log ke dalam array terstruktur untuk diunduh nanti
+        riwayatProses.push({
+            waktu: waktu,
+            kode: kode,
+            status: status,
+            alasan: alasan
+        });
+
+        // Tampilkan secara real-time pada UI panel bawah
+        if (logBox) {
+            const warna = status === "SUKSES" ? "#10B981" : "#EF4444";
+            const row = `<div style="color: ${warna}; margin-bottom: 2px;">[${waktu}] Kode: ${kode} | ${status} ${alasan ? '- '+alasan : ''}</div>`;
+            logBox.innerHTML = row + logBox.innerHTML;
+        }
+    }
+
+    // Eksekusi panel kontrol saat halaman siap
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', buatPanelKontrol);
+    } else {
+        buatPanelKontrol();
+    }
+
+})();
